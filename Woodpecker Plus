@@ -1,0 +1,283 @@
+"""
+Woodpecker Plus v3 - 文献批量下载工具
+curl_cffi (TLS指纹模拟) + BeautifulSoup，兼容 PyInstaller 打包
+"""
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import threading
+import re
+import os
+import time
+
+from curl_cffi import requests as creq
+from bs4 import BeautifulSoup
+
+VERSION = "3.1.2026.03.11"
+
+DEFAULT_SCIHUBS = [
+    "https://sci-hub.hkvisa.net/",
+    "https://sci-hub.ru/",
+    "https://sci-hub.st/",
+    "https://sci-hub.se/",
+    "https://sci-hub.ren/",
+    "https://sci-hub.mksa.top/",
+    "https://sci-hub.wf/",
+]
+
+# curl_cffi impersonate 参数：模拟 Chrome 131 的完整 TLS 指纹
+BROWSER = "chrome131"
+
+
+class DownloadError(Exception):
+    pass
+
+
+def _normalize_url(url):
+    url = url.strip()
+    if url.startswith("//"):
+        url = "https:" + url
+    return url
+
+
+def fetch_and_parse(doi, scihub_url, timeout=30):
+    """用 curl_cffi 访问 Sci-Hub（TLS 指纹模拟绕过反爬）"""
+    url = scihub_url.rstrip("/") + "/" + doi.strip()
+    r = creq.get(url, timeout=timeout, verify=False, impersonate=BROWSER, allow_redirects=True)
+
+    if r.status_code != 200:
+        raise DownloadError(f"HTTP {r.status_code}")
+
+    soup = BeautifulSoup(r.text, "html.parser")
+
+    # iframe#pdf
+    iframe = soup.find("iframe", attrs={"id": "pdf"})
+    if iframe and iframe.get("src"):
+        return _normalize_url(iframe["src"])
+
+    # 任意含 pdf 的 iframe
+    for iframe in soup.find_all("iframe"):
+        src = iframe.get("src", "")
+        if "pdf" in src.lower():
+            return _normalize_url(src)
+
+    # embed
+    embed = soup.find("embed", attrs={"type": "application/pdf"})
+    if embed and embed.get("src"):
+        return _normalize_url(embed["src"])
+
+    # button onclick
+    for btn in soup.find_all("button"):
+        onclick = btn.get("onclick", "")
+        m = re.search(r"location\.href\s*=\s*['\"]([^'\"]*\.pdf[^'\"]*)", onclick)
+        if m:
+            return _normalize_url(m.group(1))
+
+    # 正则兜底
+    matches = re.findall(r'(https?://[^\s"\'<>]+\.pdf[^\s"\'<>]*)', r.text)
+    if matches:
+        return matches[0]
+
+    raise DownloadError("article not found")
+
+
+def download_pdf(pdf_url, save_path, timeout=60):
+    """下载 PDF 并验证"""
+    r = creq.get(pdf_url, timeout=timeout, verify=False, impersonate=BROWSER)
+    if r.status_code != 200:
+        raise DownloadError(f"PDF download failed: HTTP {r.status_code}")
+
+    with open(save_path, "wb") as f:
+        f.write(r.content)
+
+    with open(save_path, "rb") as f:
+        header = f.read(5)
+    if header != b'%PDF-':
+        os.remove(save_path)
+        raise DownloadError("not a valid PDF")
+    return len(r.content)
+
+
+def fetch_article(doi, scihub_urls, save_dir):
+    doi = doi.strip()
+    if not doi:
+        return False, "empty DOI", ""
+
+    safe_name = re.sub(r'[\\/:*?"<>|]', '_', doi) + ".pdf"
+    save_path = os.path.join(save_dir, safe_name)
+
+    errors = []
+    for su in scihub_urls:
+        try:
+            pdf_url = fetch_and_parse(doi, su)
+            size = download_pdf(pdf_url, save_path)
+            return True, f"{save_path} ({size // 1024}KB)", su
+        except Exception as e:
+            errors.append(f"{su}: {e}")
+    return False, "; ".join(errors[-2:]) if errors else "all mirrors failed", ""
+
+
+# ======================== GUI ========================
+
+class LogBox:
+    def __init__(self, master, row=0):
+        frame = tk.Frame(master)
+        frame.grid(row=row, column=0, sticky="nsew", padx=8, pady=(0, 8))
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+
+        self.text = tk.Text(frame, height=12, wrap=tk.NONE, relief=tk.SUNKEN,
+                            borderwidth=1, font=("Consolas", 9),
+                            bg="#1e1e1e", fg="#d4d4d4",
+                            insertbackground="#d4d4d4", selectbackground="#264f78")
+        self.text.grid(row=0, column=0, sticky="nsew")
+
+        sy = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=self.text.yview)
+        sy.grid(row=0, column=1, sticky="ns")
+        self.text.configure(yscrollcommand=sy.set)
+
+        sx = ttk.Scrollbar(frame, orient=tk.HORIZONTAL, command=self.text.xview)
+        sx.grid(row=1, column=0, sticky="ew")
+        self.text.configure(xscrollcommand=sx.set)
+
+        for tag, color in [("success", "#6a9955"), ("error", "#f44747"),
+                           ("info", "#569cd6"), ("warn", "#ce9178"), ("time", "#808080")]:
+            self.text.tag_configure(tag, foreground=color)
+
+    def log(self, msg, tag="info"):
+        self.text.configure(state=tk.NORMAL)
+        self.text.insert(tk.END, time.strftime("[%H:%M:%S] "), "time")
+        self.text.insert(tk.END, msg + "\n", tag)
+        self.text.see(tk.END)
+        self.text.configure(state=tk.DISABLED)
+
+    def clear(self):
+        self.text.configure(state=tk.NORMAL)
+        self.text.delete("1.0", tk.END)
+        self.text.configure(state=tk.DISABLED)
+
+
+class App:
+    def __init__(self, root):
+        self.root = root
+        self.root.title(f"Woodpecker Plus v{VERSION}")
+        self.root.geometry("720x640")
+        self.root.minsize(600, 500)
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(3, weight=1)
+        self.root.rowconfigure(6, weight=1)
+        self.is_running = False
+        self._build()
+        self.log_box.log(f"Woodpecker Plus v{VERSION} ready", "info")
+        self.log_box.log(f"{len(DEFAULT_SCIHUBS)} Sci-Hub mirrors built-in", "info")
+
+    def _build(self):
+        # Sci-Hub
+        f1 = tk.Frame(self.root); f1.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4)); f1.columnconfigure(1, weight=1)
+        tk.Label(f1, text="Sci-Hub:", font=("Microsoft YaHei UI", 9)).grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self.scihub_e = ttk.Entry(f1, font=("Consolas", 10)); self.scihub_e.grid(row=0, column=1, sticky="ew"); self.scihub_e.insert(0, DEFAULT_SCIHUBS[0])
+        ttk.Button(f1, text="Test", command=self._test, width=8).grid(row=0, column=2, padx=(6, 0))
+
+        # Path
+        f2 = tk.Frame(self.root); f2.grid(row=1, column=0, sticky="ew", padx=8, pady=4); f2.columnconfigure(1, weight=1)
+        tk.Label(f2, text="Save to:", font=("Microsoft YaHei UI", 9)).grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self.path_e = ttk.Entry(f2, font=("Consolas", 10)); self.path_e.grid(row=0, column=1, sticky="ew")
+        self.path_e.insert(0, os.path.join(os.path.expanduser("~"), "Desktop", "papers"))
+        ttk.Button(f2, text="Browse", command=lambda: self._set_path(filedialog.askdirectory()), width=8).grid(row=0, column=2, padx=(6, 0))
+
+        # DOI
+        tk.Label(self.root, text="DOI list (one per line):", font=("Microsoft YaHei UI", 9), anchor="w").grid(row=2, column=0, sticky="w", padx=12, pady=(6, 2))
+        df = tk.Frame(self.root); df.grid(row=3, column=0, sticky="nsew", padx=8, pady=(0, 4)); df.columnconfigure(0, weight=1); df.rowconfigure(0, weight=1)
+        self.doi_t = tk.Text(df, height=6, wrap=tk.NONE, font=("Consolas", 10), relief=tk.SUNKEN, borderwidth=1)
+        self.doi_t.grid(row=0, column=0, sticky="nsew")
+        ds = ttk.Scrollbar(df, orient=tk.VERTICAL, command=self.doi_t.yview); ds.grid(row=0, column=1, sticky="ns"); self.doi_t.configure(yscrollcommand=ds.set)
+
+        # Buttons
+        f3 = tk.Frame(self.root); f3.grid(row=4, column=0, sticky="ew", padx=8, pady=6)
+        self.btn_dl = ttk.Button(f3, text="Download", command=self._start, width=14); self.btn_dl.pack(side=tk.LEFT)
+        self.btn_stop = ttk.Button(f3, text="Stop", command=self._stop, width=8, state=tk.DISABLED); self.btn_stop.pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(f3, text="Clear Log", command=lambda: self.log_box.clear(), width=10).pack(side=tk.RIGHT)
+        ttk.Button(f3, text="Open Folder", command=self._open, width=12).pack(side=tk.RIGHT, padx=(0, 8))
+
+        # Log
+        tk.Label(self.root, text="Log:", font=("Microsoft YaHei UI", 9), anchor="w").grid(row=5, column=0, sticky="w", padx=12, pady=(4, 0))
+        self.log_box = LogBox(self.root, row=6)
+
+        # Status
+        self.status = tk.StringVar(value="Ready"); self.progress = tk.DoubleVar(value=0)
+        sf = tk.Frame(self.root, relief=tk.SUNKEN, borderwidth=1); sf.grid(row=7, column=0, sticky="ew"); sf.columnconfigure(0, weight=1)
+        ttk.Progressbar(sf, variable=self.progress, maximum=100).grid(row=0, column=0, sticky="ew", padx=4, pady=2)
+        tk.Label(sf, textvariable=self.status, anchor="w", font=("Microsoft YaHei UI", 8)).grid(row=1, column=0, sticky="w", padx=4)
+
+    def _set_path(self, p):
+        if p: self.path_e.delete(0, tk.END); self.path_e.insert(0, p)
+
+    def _open(self):
+        p = self.path_e.get().strip()
+        if p and os.path.isdir(p): os.startfile(p)
+
+    def _test(self):
+        url = self.scihub_e.get().strip() or DEFAULT_SCIHUBS[0]
+        self.log_box.log(f"Testing {url} ...", "info")
+        def _t():
+            try:
+                r = creq.get(url, timeout=15, verify=False, impersonate=BROWSER)
+                if r.status_code == 200 and "sci-hub" in r.text.lower():
+                    self.log_box.log(f"OK: {url}", "success")
+                else:
+                    self.log_box.log(f"HTTP {r.status_code}", "warn")
+            except Exception as e:
+                self.log_box.log(f"FAIL: {e}", "error")
+        threading.Thread(target=_t, daemon=True).start()
+
+    def _mirrors(self):
+        c = self.scihub_e.get().strip()
+        if c:
+            if not c.endswith("/"): c += "/"
+            return [c] + [u for u in DEFAULT_SCIHUBS if u != c]
+        return DEFAULT_SCIHUBS[:]
+
+    def _start(self):
+        text = self.doi_t.get("1.0", tk.END).strip()
+        if not text: messagebox.showwarning("", "Enter at least one DOI"); return
+        save_dir = self.path_e.get().strip() or os.path.join(os.path.expanduser("~"), "Desktop", "papers")
+        os.makedirs(save_dir, exist_ok=True)
+        dois = [l.strip() for l in text.split("\n") if l.strip()]
+        if not dois: return
+        mirrors = self._mirrors()
+        self.is_running = True; self.btn_dl.configure(state=tk.DISABLED); self.btn_stop.configure(state=tk.NORMAL)
+        self.log_box.log(f"Downloading {len(dois)} articles -> {save_dir}", "info")
+
+        def _w():
+            ok = fail = 0; fl = []
+            for i, doi in enumerate(dois):
+                if not self.is_running: self.log_box.log("Stopped", "warn"); break
+                self.progress.set((i / len(dois)) * 100); self.status.set(f"{i+1}/{len(dois)}: {doi}")
+                self.log_box.log(f"[{i+1}/{len(dois)}] {doi}", "info")
+                s, msg, m = fetch_article(doi, mirrors, save_dir)
+                if s:
+                    ok += 1; short = m.split("//")[1].rstrip("/") if "//" in m else m
+                    self.log_box.log(f"  OK {msg} (via {short})", "success")
+                else:
+                    fail += 1; fl.append(doi); self.log_box.log(f"  FAIL {msg}", "error")
+                if self.is_running and i < len(dois) - 1: time.sleep(1.5)
+            self.progress.set(100)
+            self.log_box.log("=" * 50, "info")
+            self.log_box.log(f"Done! OK={ok} FAIL={fail}", "success" if fail == 0 else "warn")
+            if fl: self.log_box.log("Failed: " + ", ".join(fl), "error")
+            self.status.set(f"Done - OK {ok} / FAIL {fail}")
+            self.is_running = False; self.btn_dl.configure(state=tk.NORMAL); self.btn_stop.configure(state=tk.DISABLED)
+        threading.Thread(target=_w, daemon=True).start()
+
+    def _stop(self):
+        self.is_running = False; self.btn_stop.configure(state=tk.DISABLED)
+
+
+def main():
+    try:
+        from ctypes import windll; windll.shcore.SetProcessDpiAwareness(1)
+    except: pass
+    root = tk.Tk(); App(root); root.mainloop()
+
+if __name__ == "__main__":
+    main()
