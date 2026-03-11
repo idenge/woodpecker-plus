@@ -1,0 +1,194 @@
+---
+name: woodpecker-plus
+description: 学术文献批量下载工具。基于 Sci-Hub 镜像自动轮询 + curl_cffi TLS 指纹模拟，绕过反爬限制，支持 DOI 批量输入、多镜像容灾、PDF 自动验证。可生成 GUI 桌面应用或打包为单文件 exe。适用于科研人员离校后批量下载论文的场景。
+version: 3.1.0
+license: MIT
+author: hzp (enhanced from wolfsonliu/woodpecker)
+tags: [academic, sci-hub, paper-download, doi, literature]
+---
+
+# Woodpecker Plus
+
+Batch academic paper downloader via Sci-Hub mirrors with TLS fingerprint impersonation.
+
+## Background
+
+Original [wolfsonliu/woodpecker](https://github.com/wolfsonliu/woodpecker) was a PyInstaller-packed exe with hardcoded Sci-Hub URLs (`.tw/.hk/.cc/.bz`). Those domains have been hijacked by domain squatters, rendering the tool unusable. This skill rebuilds it with:
+
+1. **Updated mirror list** (7 mirrors, auto-failover)
+2. **curl_cffi** for TLS fingerprint impersonation (`chrome131`) — the key to bypassing Sci-Hub's anti-bot detection that blocks plain `requests`
+3. **PyInstaller-friendly** architecture (no heavy deps like scrapling/playwright)
+
+## When to Use
+
+- User wants to download academic papers by DOI
+- User mentions Sci-Hub, paper download, literature download, or DOI
+- User has a list of DOIs and wants batch download
+- User's existing download tool stopped working (likely stale mirrors)
+
+## Architecture
+
+```
+User Input (DOIs)
+       │
+       ▼
+┌─────────────────┐
+│  Mirror Rotator  │  Try mirrors in order, skip on failure
+│  (7 Sci-Hub URLs)│
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│   curl_cffi      │  TLS fingerprint = chrome131
+│   GET /DOI       │  Auto-follow redirects
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│  BeautifulSoup   │  Parse: iframe#pdf > iframe[pdf] > embed > regex
+│  PDF URL Extract │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│  Download & Save │  Stream download, %PDF- header validation
+│  DOI → filename  │
+└─────────────────┘
+```
+
+## Core Implementation
+
+### Dependencies
+
+```
+pip install curl_cffi beautifulsoup4
+```
+
+For exe packaging:
+```
+pip install pyinstaller
+```
+
+### Mirror List (update as needed)
+
+```python
+DEFAULT_SCIHUBS = [
+    "https://sci-hub.hkvisa.net/",
+    "https://sci-hub.ru/",
+    "https://sci-hub.st/",
+    "https://sci-hub.se/",
+    "https://sci-hub.ren/",
+    "https://sci-hub.mksa.top/",
+    "https://sci-hub.wf/",
+]
+```
+
+> **Why curl_cffi, not requests?**  
+> Sci-Hub mirrors (especially via CDN like hkvisa.net) perform TLS fingerprint checks. Plain `requests` uses Python's default TLS stack which gets detected and blocked (connection timeout). `curl_cffi` with `impersonate="chrome131"` mimics Chrome's exact TLS handshake, passing the check.
+
+### Fetch + Parse Pattern
+
+```python
+from curl_cffi import requests as creq
+from bs4 import BeautifulSoup
+
+def fetch_and_parse(doi, scihub_url, timeout=30):
+    url = scihub_url.rstrip("/") + "/" + doi.strip()
+    r = creq.get(url, timeout=timeout, verify=False,
+                 impersonate="chrome131", allow_redirects=True)
+    if r.status_code != 200:
+        raise DownloadError(f"HTTP {r.status_code}")
+
+    soup = BeautifulSoup(r.text, "html.parser")
+
+    # Priority order for PDF URL extraction:
+    # 1. iframe#pdf (classic Sci-Hub layout)
+    iframe = soup.find("iframe", attrs={"id": "pdf"})
+    if iframe and iframe.get("src"):
+        return normalize(iframe["src"])
+
+    # 2. Any iframe with 'pdf' in src
+    for iframe in soup.find_all("iframe"):
+        src = iframe.get("src", "")
+        if "pdf" in src.lower():
+            return normalize(src)
+
+    # 3. embed[type="application/pdf"]
+    embed = soup.find("embed", attrs={"type": "application/pdf"})
+    if embed and embed.get("src"):
+        return normalize(embed["src"])
+
+    # 4. Regex fallback
+    import re
+    matches = re.findall(r'(https?://[^\s"\'<>]+\.pdf[^\s"\'<>]*)', r.text)
+    if matches:
+        return matches[0]
+
+    raise DownloadError("article not found")
+```
+
+### PDF Download with Validation
+
+```python
+def download_pdf(pdf_url, save_path, timeout=60):
+    r = creq.get(pdf_url, timeout=timeout, verify=False, impersonate="chrome131")
+    if r.status_code != 200:
+        raise DownloadError(f"HTTP {r.status_code}")
+    with open(save_path, "wb") as f:
+        f.write(r.content)
+    # Validate PDF header
+    with open(save_path, "rb") as f:
+        if f.read(5) != b'%PDF-':
+            os.remove(save_path)
+            raise DownloadError("not a valid PDF")
+    return len(r.content)
+```
+
+### Multi-Mirror Failover
+
+```python
+def fetch_article(doi, mirrors, save_dir):
+    safe_name = re.sub(r'[\\/:*?"<>|]', '_', doi) + ".pdf"
+    save_path = os.path.join(save_dir, safe_name)
+    for mirror in mirrors:
+        try:
+            pdf_url = fetch_and_parse(doi, mirror)
+            size = download_pdf(pdf_url, save_path)
+            return True, save_path, size, mirror
+        except Exception:
+            continue
+    return False, None, 0, None
+```
+
+## GUI (tkinter)
+
+The full GUI includes: Sci-Hub address input + test button, save path browser, DOI text area (one per line), download/stop buttons, dark-theme log box with color-coded output, progress bar.
+
+See `woodpecker_plus.py` in this skill directory for the complete implementation.
+
+## PyInstaller Packaging
+
+```
+pyinstaller --onefile --windowed --name Woodpecker_Plus woodpecker_plus.py
+```
+
+Key spec settings for clean packaging:
+```python
+hiddenimports=['curl_cffi', 'curl_cffi.requests', 'curl_cffi.curl', 'curl_cffi.const', 'certifi']
+excludes=['scrapling', 'patchright', 'camoufox', 'playwright', 'browserforge',
+          'matplotlib', 'numpy', 'pandas', 'scipy', 'PIL']
+```
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Connection timeout with `requests` | TLS fingerprint blocked | Use `curl_cffi` with `impersonate="chrome131"` |
+| All mirrors fail | Mirrors changed | Search for latest Sci-Hub mirrors, update `DEFAULT_SCIHUBS` |
+| PDF validation fails | Got HTML error page instead | Mirror may be hijacked; try next mirror |
+| PyInstaller exe crashes silently | Missing hidden imports | Add `curl_cffi.*` to `hiddenimports`, build with `console=True` first to see errors |
+
+## Credits
+
+Original tool: [wolfsonliu/woodpecker](https://github.com/wolfsonliu/woodpecker)  
+Enhancement: TLS fingerprint bypass, updated mirrors, GUI rebuild, exe packaging
